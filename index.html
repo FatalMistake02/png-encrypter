@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PNG Encrypter</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    font-size: 14px;
+    max-width: 780px;
+    margin: 20px auto;
+    padding: 0 15px;
+    line-height: 1.5;
+  }
+  h1 { font-size: 18px; font-weight: 600; }
+  h2 { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+  fieldset { border: 1px solid #ccc; padding: 15px; margin: 0 0 20px; }
+  legend { font-weight: 600; padding: 0 5px; }
+  textarea {
+    width: 100%;
+    height: 160px;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 13px;
+    padding: 8px;
+    border: 1px solid #999;
+  }
+  input[type=text] {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 13px;
+    padding: 5px 8px;
+    border: 1px solid #999;
+    width: 220px;
+  }
+  button { font-size: 14px; padding: 5px 12px; margin-right: 6px; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .row { margin-top: 10px; }
+  .status { font-size: 13px; color: #555; }
+  .split { display: flex; gap: 25px; flex-wrap: wrap; align-items: flex-start; margin-top: 15px; }
+  .split > div:first-child { flex: 1 1 260px; min-width: 240px; }
+  table { border-collapse: collapse; font-size: 13px; width: 100%; }
+  th, td { text-align: left; padding: 3px 8px 3px 0; border-bottom: 1px solid #eee; }
+  th { font-weight: 600; color: #555; }
+  td.bad { color: #b00; }
+  tr.win td { font-weight: 700; }
+  #previewCanvas {
+    image-rendering: pixelated;
+    border: 1px solid #999;
+    background: #fff;
+    max-width: 100%;
+  }
+  #densityNote { font-size: 13px; color: #555; margin-top: 8px; }
+  #textOutput {
+    margin-top: 12px;
+    padding: 10px;
+    border: 1px solid #ccc;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 13px;
+    max-height: 400px;
+    overflow: auto;
+  }
+</style>
+</head>
+<body>
+
+<h1>PNG Encrypter</h1>
+
+<fieldset>
+  <legend>Text to PNG</legend>
+  <textarea id="inputText" placeholder="Text to hide in an image"></textarea>
+  <div class="row">
+    <input type="text" id="keyInput" placeholder="Key (optional)">
+  </div>
+  <div class="row">
+    <button id="btnEncode" onclick="encodeText()">Encrypt to PNG</button>
+    <span class="status" id="encodeStatus"></span>
+  </div>
+  <div class="split">
+    <div>
+      <table id="benchTable"></table>
+    </div>
+    <div>
+      <canvas id="previewCanvas"></canvas>
+      <div id="densityNote"></div>
+    </div>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>PNG to text</legend>
+  <input type="file" id="imageInput" accept="image/png">
+  <div class="row">
+    <button id="btnDecode" onclick="decodeImage()">Extract text</button>
+    <span class="status" id="decodeStatus"></span>
+  </div>
+  <div id="textOutput" style="display:none"></div>
+</fieldset>
+
+<script>
+"use strict";
+
+/* ============================================================
+   PIXEL FORMAT
+   ------------------------------------------------------------
+   The image is a lossless byte container. Every pixel is fully
+   opaque (alpha = 255) so browsers can never premultiply and
+   destroy our values. Only R, G and B carry data -> 3 bytes/px.
+
+   Header = 4 pixels (12 bytes):
+     px0 : payload length in base64 chars  (3 bytes, LE)
+     px1 : original UTF-8 byte length       (3 bytes, LE)
+     px2 : checksum of payload              (3 bytes)
+     px3 : codec id  (0 = raw, else index into codecs/manifest.js)
+   Payload starts at pixel 4.
+   ============================================================ */
+
+const MANIFEST_URL = "./codecs/manifest.js";
+
+// 64 distinct values in 3..253. Never 0 and never 255, so a padding
+// pixel can never be mistaken for data.
+const SAFE_COLORS = [];
+for (let i = 0; i < 64; i++) SAFE_COLORS.push(Math.round(i * (250 / 63)) + 3);
+const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const CHANNELS = 3;
+const HEADER_PIXELS = 4;
+
+let VERSIONS = [];   // [{key, url}]
+let benchResults = [];
+
+function colorToCharIndex(val) {
+  let best = -1, minDiff = Infinity;
+  for (let j = 0; j < SAFE_COLORS.length; j++) {
+    const d = Math.abs(val - SAFE_COLORS[j]);
+    if (d < minDiff) { minDiff = d; best = j; }
+  }
+  return minDiff <= 2 ? best : -1;
+}
+
+/* ---------- base64 helpers (padding-free) ---------- */
+function bytesToB64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  }
+  return btoa(bin).replace(/=+$/, "");
+}
+function b64ToBytes(b64) {
+  while (b64.length % 4 !== 0) b64 += "=";
+  const raw = atob(b64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+/* ============================================================
+   CODEC LOADER
+   Codecs are ES modules that assign window.encrypt / window.decrypt
+   when their body runs. They are imported straight into this page and
+   the two functions are snapshotted before the next import replaces them.
+
+   NOTE: no literal "</" sequence may appear inside this <script> block.
+   A stray "</...>" in script source can make some HTML parsers bail out
+   of raw-text mode early, which shows the JS as page text.
+   ============================================================ */
+const LT = String.fromCharCode(60);
+const SLASH = String.fromCharCode(47);
+const CL = LT + SLASH;   // "</" without ever writing it literally in this file
+
+/**
+ * Codecs are cached by URL.
+ *
+ * An ES module body runs only ONCE per URL. A second import() of the same URL
+ * resolves from cache without re-running the body, so window.encrypt and
+ * window.decrypt keep pointing at whichever codec was imported last. Reading
+ * the globals again would silently hand back the wrong codec, so the snapshot
+ * taken on first load is cached and reused.
+ */
+const CODEC_CACHE = new Map();
+
+/**
+ * Loads a codec and returns its encrypt/decrypt pair.
+ *
+ * Each codec assigns window.encrypt / window.decrypt when its module body runs.
+ * We snapshot those two functions immediately after the import resolves, before
+ * the next import can overwrite them, then keep them in CODEC_CACHE.
+ *
+ * This used to run inside a throwaway iframe, which broke two ways:
+ *   - an srcdoc iframe's URL is "about:srcdoc", so the
+ *     window.location.href.includes("http://localhost:") check inside the
+ *     Kolbe 2.x codecs was false and they fetched helpers.js from the CDN
+ *     instead of the local copy, hanging until the timeout;
+ *   - relative imports such as "./helpers.js" had no usable base URL.
+ * Importing into this page avoids both problems.
+ */
+async function loadCodec(url, timeoutMs = 8000) {
+  if (CODEC_CACHE.has(url)) return CODEC_CACHE.get(url);
+
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("codec load timeout")), timeoutMs);
+  });
+  try {
+    await Promise.race([import(/* @vite-ignore */ url), guard]);
+  } catch (e) {
+    throw new Error(e && e.message ? e.message : String(e));
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const enc = window.encrypt;
+  const dec = window.decrypt;
+  if (typeof enc !== "function" || typeof dec !== "function") {
+    throw new Error("module loaded but exposed no encrypt/decrypt");
+  }
+  const codec = { encrypt: enc, decrypt: dec };
+  CODEC_CACHE.set(url, codec);
+  return codec;
+}
+// A codec's output is stored one of two ways, chosen by feature detection:
+//   raw   - the codec exposes encodeBytes/decodeBytes, so its bytes go
+//           straight into the pixels with no base64 layer at all
+//   base64- legacy block-char codecs: the string is UTF-8 encoded, then base64
+//           into 64 safe colours (6 bits per 8 spent)
+function codecMode(codec) {
+  return typeof codec.encodeBytes === "function" && typeof codec.decodeBytes === "function"
+    ? "raw"
+    : "base64";
+}
+
+// Cost in base64-character units, so both modes can be compared fairly.
+function payloadCost(bytes, mode) {
+  return mode === "raw" ? bytes.length : Math.ceil((bytes.length * 8) / 6);
+}
+
+async function getVersions() {
+  if (VERSIONS.length) return VERSIONS;
+  await import(MANIFEST_URL);
+  if (!window.LOCAL_VERSIONS) {
+    throw new Error(
+      "codecs/manifest.js did not load. Serve the folder over http:// (run start.bat) " +
+      "instead of opening the file directly, because ES modules are blocked on file://."
+    );
+  }
+  // Object key order is preserved and matches the manifest, so codec ids stay
+  // stable. New codecs must only ever be APPENDED.
+  VERSIONS = Object.entries(window.LOCAL_VERSIONS).map(([key, url]) => ({
+    key,
+    url: new URL(url, new URL(MANIFEST_URL, location.href)).href
+  }));
+  return VERSIONS;
+}
+
+async function getCodec(index) {
+  const versions = await getVersions();
+  const v = versions[index - 1];              // 0 is reserved for "raw"
+  if (!v) throw new Error("unknown codec id " + index);
+  return loadCodec(v.url);
+}
+
+/* ============================================================
+   ENCODE
+   ============================================================ */
+
+async function encodeText() {
+  const text = document.getElementById("inputText").value;
+  const key = document.getElementById("keyInput").value;
+  const status = document.getElementById("encodeStatus");
+  const btn = document.getElementById("btnEncode");
+
+  if (!text) return alert("Please enter some text");
+  btn.disabled = true;
+  status.textContent = "loading codecs...";
+
+  const originalBytes = new TextEncoder().encode(text);
+
+  try {
+    await getVersions();
+  } catch (e) {
+    btn.disabled = false;
+    status.textContent = "";
+    return alert("Could not load the local codec list.\n\n" + e.message);
+  }
+
+  // Try every codec, keep whichever stores in the fewest pixels.
+  const candidates = [];
+  candidates.push({ id: 0, name: "raw (no codec)", mode: "raw",
+                    bytes: originalBytes, cost: payloadCost(originalBytes, "raw"), error: null });
+
+  status.textContent = "benchmarking " + VERSIONS.length + " codec(s)...";
+
+  for (let i = 0; i < VERSIONS.length; i++) {
+    const v = VERSIONS[i];
+    const row = { id: i + 1, name: v.key, bytes: null, mode: null, cost: Infinity, error: null };
+    try {
+      const codec = await loadCodec(v.url);
+      const mode = codecMode(codec);
+      let bytes, back;
+      if (mode === "raw") {
+        bytes = codec.encodeBytes(text);
+        back = codec.decodeBytes(bytes);
+      } else {
+        const packed = await codec.encrypt(text, key);
+        bytes = new TextEncoder().encode(packed);
+        back = await codec.decrypt(packed, key);
+      }
+      // never trust a codec that cannot reproduce the input exactly
+      if (back !== text) throw new Error("round-trip mismatch");
+      row.mode = mode;
+      row.bytes = bytes;
+      row.cost = payloadCost(bytes, mode);
+    } catch (e) {
+      row.error = e.message;
+    }
+    candidates.push(row);
+    renderBench(candidates);
+    status.textContent = "tested " + (i + 1) + "/" + VERSIONS.length;
+  }
+
+  const winner = candidates.reduce((a, b) => (b.bytes !== null && b.cost < a.cost ? b : a));
+  if (!winner.bytes) {
+    btn.disabled = false;
+    return alert("No codec succeeded.");
+  }
+
+  benchResults = candidates;
+  renderBench(candidates);
+
+  // Payload becomes a flat list of channel values: 3 bytes per pixel, packed
+  // continuously across pixel boundaries so nothing is rounded per character.
+  let stream;
+  if (winner.mode === "raw") {
+    stream = Array.from(winner.bytes);
+  } else {
+    const b64 = bytesToB64(winner.bytes);
+    stream = [];
+    for (let i = 0; i < b64.length; i++) {
+      const idx = B64_CHARS.indexOf(b64[i]);
+      if (idx < 0) throw new Error("bad base64 char");
+      stream.push(SAFE_COLORS[idx]);
+    }
+  }
+
+  const streamLen = stream.length;
+  let sum = 0;
+  for (let i = 0; i < streamLen; i++) sum += stream[i];
+  const checksum = sum & 0xFF;
+  const byteLen = originalBytes.length;
+
+  // header pixels
+  stream = [
+    streamLen & 0xFF, (streamLen >> 8) & 0xFF, (streamLen >> 16) & 0xFF,
+    byteLen & 0xFF, (byteLen >> 8) & 0xFF, (byteLen >> 16) & 0xFF,
+    checksum, 0, 0,
+    winner.id, 0, 0
+  ].concat(stream);
+
+  const payloadVals = stream.length - HEADER_PIXELS * CHANNELS;
+  const totalPixels = HEADER_PIXELS + Math.ceil(payloadVals / CHANNELS);
+  const side = Math.ceil(Math.sqrt(totalPixels));
+
+  const canvas = document.getElementById("previewCanvas");
+  const ctx = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
+  canvas.width = side;
+  canvas.height = side;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, side, side);
+
+  const imgData = ctx.getImageData(0, 0, side, side);
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) data[i + 3] = 255;
+
+  for (let p = 0; p < totalPixels; p++) {
+    for (let c = 0; c < CHANNELS; c++) {
+      const s = p * CHANNELS + c;
+      data[p * 4 + c] = s < stream.length ? stream[s] : 255;
+    }
+    data[p * 4 + 3] = 255;
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+
+  status.textContent = winner.name + " | " + side + "x" + side + " px";
+  const charsPerPx = (originalBytes.length / (side * side)).toFixed(2);
+  document.getElementById("densityNote").innerHTML =
+    "Original: <b>" + originalBytes.length + CL + "b> UTF-8 bytes<br>" +
+    "Payload: <b>" + streamLen + CL + "b> channel values (" +
+      (winner.mode === "raw" ? "raw bytes" : "base64 in safe colours") + ")<br>" +
+    "Image: <b>" + side + "&times;" + side + CL + "b> = " + (side * side) + " px<br>" +
+    "Density: <b>" + charsPerPx + CL + "b> chars per pixel";
+
+  canvas.toBlob((blob) => {
+    const link = document.createElement("a");
+    link.download = "encrypted_text.png";
+    link.href = URL.createObjectURL(blob);
+    link.click();
+  }, "image/png");
+
+  btn.disabled = false;
+}
+
+function renderBench(cands) {
+  const cost = (c) => (c.bytes === null ? Infinity : c.cost);
+  const best = Math.min.apply(null, cands.map(cost));
+  const rows = cands
+    .slice()
+    .sort((a, b) => cost(a) - cost(b))
+    .map((c) => {
+      const failed = c.bytes === null;
+      const cls = failed ? ' class="bad"' : cost(c) === best ? ' class="win"' : "";
+      const val = failed ? (c.error || "failed") : String(c.cost);
+      const tag = failed || c.mode === "raw" ? "" : " (b64)";
+      return "<tr" + cls + "><td>" + c.name + tag + CL + "td><td>" + val + CL + "td>" + CL + "tr>";
+    })
+    .join("");
+  document.getElementById("benchTable").innerHTML =
+    "<tr><th>Codec" + CL + "th><th>Channel values" + CL + "th>" + CL + "tr>" + rows;
+}
+
+/* ============================================================
+   DECODE
+   ============================================================ */
+
+async function decodeImage() {
+  const fileInput = document.getElementById("imageInput");
+  const status = document.getElementById("decodeStatus");
+  const btn = document.getElementById("btnDecode");
+
+  if (!fileInput.files[0]) return alert("Please select a PNG image");
+  const file = fileInput.files[0];
+  const img = new Image();
+  const url = URL.createObjectURL(file);
+  img.src = url;
+
+  await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error("bad image")); });
+
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
+  canvas.width = img.width;
+  canvas.height = img.height;
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0);
+  URL.revokeObjectURL(url);
+
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+  // Header values sit in pixels 0..3, one channel each.
+  // pixel p channel c -> data[p*4+c]
+  const streamLen = data[0] | (data[1] << 8) | (data[2] << 16);
+  const byteLen = data[4] | (data[5] << 8) | (data[6] << 16);
+  const checksum = data[8];
+  const codecId = data[12];
+
+  const needPixels = HEADER_PIXELS + Math.ceil(streamLen / CHANNELS);
+  // streamLen 0 is legitimate: empty input produces an empty payload
+  if ((streamLen <= 0 && byteLen !== 0) || needPixels * 4 > data.length) {
+    return alert("Not a valid encrypted image (bad header).");
+  }
+
+  // Read the payload as raw channel values. Whether those values are literal
+  // bytes or base64-in-safe-colours depends on the codec, which we only know
+  // after loading it -- so read them once, then interpret.
+  const values = new Uint8Array(streamLen);
+  let sum = 0;
+  for (let i = 0; i < streamLen; i++) {
+    const p = Math.floor(i / CHANNELS) + HEADER_PIXELS;
+    const c = i % CHANNELS;
+    const v = data[p * 4 + c];
+    values[i] = v;
+    sum += v;
+  }
+
+  let text;
+  let name;
+  let mode;
+
+  if (codecId === 0) {
+    mode = "raw";
+    name = "raw";
+    try { text = new TextDecoder().decode(values); }
+    catch (e) { return alert("Could not decode pixel data: " + e.message); }
+  } else {
+    btn.disabled = true;
+    status.textContent = "loading codec " + codecId + "...";
+    try {
+      await getVersions();
+      const v = VERSIONS[codecId - 1];
+      if (!v) {
+        throw new Error("this image used codec id " + codecId + ", which is not in the local manifest");
+      }
+      name = v.key;
+      const codec = await loadCodec(v.url);
+      mode = codecMode(codec);
+
+      if (mode === "raw") {
+        text = codec.decodeBytes(values);
+      } else {
+        let b64 = "";
+        let bad = 0;
+        for (let i = 0; i < streamLen; i++) {
+          const idx = colorToCharIndex(values[i]);
+          if (idx < 0) { bad++; b64 += "A"; } else b64 += B64_CHARS[idx];
+        }
+        const packed = new TextDecoder().decode(b64ToBytes(b64));
+        const key = document.getElementById("keyInput").value;
+        text = await codec.decrypt(packed, key);
+      }
+    } catch (e) {
+      btn.disabled = false;
+      status.textContent = "";
+      return alert("Decoding failed: " + e.message);
+    }
+    btn.disabled = false;
+  }
+
+  void mode;
+  const ok = (sum & 0xFF) === checksum;
+  const out = document.getElementById("textOutput");
+  out.style.display = "block";
+  out.style.borderColor = ok ? "#999" : "#b00";
+  out.textContent = text;
+  if (!ok) out.textContent += "\n\n[checksum mismatch - the image may be damaged]";
+  status.textContent = "decoded with " + name + " (" + mode + ", " + byteLen + " UTF-8 bytes)";
+}
+</script>
+</body>
+</html>

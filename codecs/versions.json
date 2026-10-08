@@ -1,0 +1,9 @@
+{
+    "Kolbe 1.0.0": "https://cdn.jsdelivr.net/gh/kolbe-tessarzik/BlockTranslator@610dc1d909af06e59c93d9be06be69c9fc2e38a1/codec.js",
+    "Kolbe 2.0.5": "https://cdn.jsdelivr.net/gh/kolbe-tessarzik/BlockTranslator@406728ae03fed9a3d58013decb6d0ead37323e9a/codec.js?force=1",
+    "Kolbe 2.1.0": "https://cdn.jsdelivr.net/gh/kolbe-tessarzik/BlockTranslator@92268f3733bb21296dfa6519b1aa7b6ceb643b5e/codec.js?force=1",
+    "Kolbe 2.2.0": "https://cdn.jsdelivr.net/gh/kolbe-tessarzik/BlockTranslator@6c8595909439d5837e32dc2dd8dc9082d28fc93d/codec.js?force=1",
+    "Kolbe 2.3.0": "https://cdn.jsdelivr.net/gh/kolbe-tessarzik/BlockTranslator@ba82791832700159320cc10364d47c4f7ad7fce1/codec.js?force=1",
+    "Fatal 5.0.0": "https://cdn.jsdelivr.net/gh/FatalMistake02/encrypter@261df82c2398ba5a862d6b3236e90251a15af8ba/v5.js",
+    "Fatal 6.1.0": "https://cdn.jsdelivr.net/gh/FatalMistake02/encrypter@cb6eec44ecb1da19957b8435e929385c21f9db9d/v6.js?force=1"
+}

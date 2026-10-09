@@ -49,6 +49,12 @@
     background: #fff;
     max-width: 100%;
   }
+  /* the carrier is a real photo, so it must NOT be pixelated or scaled up */
+  #carrierPreview {
+    border: 1px solid #999;
+    max-width: 100%;
+    height: auto;
+  }
   #densityNote { font-size: 13px; color: #555; margin-top: 8px; }
   #textOutput {
     margin-top: 12px;
@@ -96,6 +102,27 @@
     <span class="status" id="decodeStatus"></span>
   </div>
   <div id="textOutput" style="display:none"></div>
+</fieldset>
+
+<fieldset>
+  <legend>Hide in an image</legend>
+  <p style="margin:0 0 8px">
+    Writes into the low bit of each red, green and blue channel, so each pixel
+    shifts by at most 1/255. Alpha is left alone. Uses the text box above.
+  </p>
+  <input type="file" id="carrierInput" accept="image/*" onchange="loadCarrier()">
+  <div class="status" id="carrierInfo"></div>
+  <div class="row">
+    <button id="btnStegEncode" onclick="encryptIntoImage()">Hide text in image</button>
+    <button id="btnStegDecode" onclick="extractFromImage()">Extract text</button>
+    <span class="status" id="stegStatus"></span>
+  </div>
+  <div class="split">
+    <div>
+      <canvas id="carrierPreview"></canvas>
+    </div>
+  </div>
+  <div id="stegOutput" style="display:none"></div>
 </fieldset>
 
 <script>
@@ -260,33 +287,25 @@ async function getCodec(index) {
 }
 
 /* ============================================================
-   ENCODE
+   CODEC BENCHMARK (shared by both output modes)
    ============================================================ */
 
-async function encodeText() {
-  const text = document.getElementById("inputText").value;
-  const key = document.getElementById("keyInput").value;
-  const status = document.getElementById("encodeStatus");
-  const btn = document.getElementById("btnEncode");
-
-  if (!text) return alert("Please enter some text");
-  btn.disabled = true;
+/**
+ * Compresses `text` with every codec, verifies each result round-trips
+ * exactly, and returns the one that stores in the fewest channel values.
+ * Throws if the codec list cannot be loaded.
+ */
+async function benchmarkCodecs(text, key, status) {
   status.textContent = "loading codecs...";
-
   const originalBytes = new TextEncoder().encode(text);
 
-  try {
-    await getVersions();
-  } catch (e) {
-    btn.disabled = false;
-    status.textContent = "";
-    return alert("Could not load the local codec list.\n\n" + e.message);
-  }
+  await getVersions();
 
-  // Try every codec, keep whichever stores in the fewest pixels.
   const candidates = [];
-  candidates.push({ id: 0, name: "raw (no codec)", mode: "raw",
-                    bytes: originalBytes, cost: payloadCost(originalBytes, "raw"), error: null });
+  candidates.push({
+    id: 0, name: "raw (no codec)", mode: "raw",
+    bytes: originalBytes, cost: payloadCost(originalBytes, "raw"), error: null
+  });
 
   status.textContent = "benchmarking " + VERSIONS.length + " codec(s)...";
 
@@ -318,8 +337,130 @@ async function encodeText() {
     status.textContent = "tested " + (i + 1) + "/" + VERSIONS.length;
   }
 
-  const winner = candidates.reduce((a, b) => (b.bytes !== null && b.cost < a.cost ? b : a));
-  if (!winner.bytes) {
+  const winner = candidates.reduce(
+    (a, b) => (b.bytes !== null && b.cost < a.cost ? b : a), candidates[0]
+  );
+  return { winner, candidates, originalBytes };
+}
+
+/* ============================================================
+   LSB STEGANOGRAPHY
+   ------------------------------------------------------------
+   Hides the payload in the low bit of each R, G and B channel.
+
+   Capacity is 3 bits per pixel. Alpha is deliberately untouched: it is
+   both the most visible channel to change (large flat areas shift as a
+   block) and the one browsers premultiply.
+
+   Each written bit moves a channel by at most 1/255, which is below the
+   threshold of visibility in normal images.
+
+   Bits go in pixel order, R then G then B, most significant bit of each
+   byte first. The reader must walk them in exactly the same order.
+   ============================================================ */
+
+const STEG_MAGIC = [0x50, 0x45, 0x4e, 0x43];   // "PENC"
+const STEG_VERSION = 1;
+const STEG_HEADER_BYTES = 16;
+const STEG_CHANNELS = 3;                        // R, G, B
+
+function stegCapacityBytes(width, height) {
+  return Math.floor((width * height * STEG_CHANNELS) / 8);
+}
+
+/**
+ * Writes bits into the image's low bits.
+ * `stream` is a Uint8Array; every bit of it is embedded.
+ */
+function stegWrite(img, stream, startBit) {
+  let bit = startBit;
+  const total = img.length / 4 * STEG_CHANNELS;
+  for (let i = 0; i < stream.length; i++) {
+    const byte = stream[i];
+    for (let b = 7; b >= 0; b--) {
+      if (bit >= total) throw new Error("image does not have enough room");
+      const p = Math.floor(bit / STEG_CHANNELS);
+      const c = bit % STEG_CHANNELS;
+      const o = p * 4 + c;
+      img[o] = (img[o] & ~1) | ((byte >> b) & 1);
+      bit++;
+    }
+  }
+  return bit;
+}
+
+/** Reads `n` bits back out of the low bits, starting at `startBit`. */
+function stegRead(img, n, startBit) {
+  const out = new Uint8Array(n);
+  let bit = startBit;
+  const total = img.length / 4 * STEG_CHANNELS;
+  for (let i = 0; i < n; i++) {
+    let byte = 0;
+    for (let b = 7; b >= 0; b--) {
+      if (bit >= total) throw new Error("image does not have enough room");
+      const p = Math.floor(bit / STEG_CHANNELS);
+      const c = bit % STEG_CHANNELS;
+      byte = (byte * 2) | (img[p * 4 + c] & 1);
+      bit++;
+    }
+    out[i] = byte;
+  }
+  return out;
+}
+
+function stegBuildHeader(codecId, payloadLen, origLen, checksum) {
+  const h = new Uint8Array(STEG_HEADER_BYTES);
+  h.set(STEG_MAGIC, 0);
+  h[4] = STEG_VERSION;
+  h[5] = STEG_CHANNELS;                  // channels used per pixel
+  h[6] = codecId;
+  h[7] = 0;                              // reserved
+  h[8] = payloadLen & 0xFF;
+  h[9] = (payloadLen >> 8) & 0xFF;
+  h[10] = (payloadLen >> 16) & 0xFF;
+  h[11] = origLen & 0xFF;
+  h[12] = (origLen >> 8) & 0xFF;
+  h[13] = (origLen >> 16) & 0xFF;
+  h[14] = checksum;
+  h[15] = 0;
+  return h;
+}
+
+function stegParseHeader(h) {
+  for (let i = 0; i < 4; i++) if (h[i] !== STEG_MAGIC[i]) return null;
+  if (h[4] !== STEG_VERSION) return null;
+  return {
+    codecId: h[6],
+    payloadLen: h[8] | (h[9] << 8) | (h[10] << 16),
+    origLen: h[11] | (h[12] << 8) | (h[13] << 16),
+    checksum: h[14]
+  };
+}
+
+/* ============================================================
+   ENCODE
+   ============================================================ */
+
+async function encodeText() {
+  const text = document.getElementById("inputText").value;
+  const key = document.getElementById("keyInput").value;
+  const status = document.getElementById("encodeStatus");
+  const btn = document.getElementById("btnEncode");
+
+  if (!text) return alert("Please enter some text");
+  btn.disabled = true;
+
+  let pick;
+  try {
+    pick = await benchmarkCodecs(text, key, status);
+  } catch (e) {
+    btn.disabled = false;
+    status.textContent = "";
+    return alert("Could not load the local codec list.\n\n" + e.message);
+  }
+
+  const { winner, originalBytes, candidates } = pick;
+  if (!winner) {
     btn.disabled = false;
     return alert("No codec succeeded.");
   }
@@ -416,6 +557,184 @@ function renderBench(cands) {
     .join("");
   document.getElementById("benchTable").innerHTML =
     "<tr><th>Codec" + CL + "th><th>Channel values" + CL + "th>" + CL + "tr>" + rows;
+}
+
+/* ============================================================
+   IMAGE MODE
+   ============================================================ */
+
+let carrierImage = null;   // ImageData of the loaded carrier
+
+function loadCarrier(onReady) {
+  const file = document.getElementById("carrierInput").files[0];
+  if (!file) return alert("Choose a carrier image first");
+  const img = new Image();
+  const url = URL.createObjectURL(file);
+  img.onload = () => {
+    const c = document.createElement("canvas");
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    const cx = c.getContext("2d", { willReadFrequently: true });
+    cx.drawImage(img, 0, 0);
+    carrierImage = cx.getImageData(0, 0, c.width, c.height);
+    URL.revokeObjectURL(url);
+
+    const info = document.getElementById("carrierInfo");
+    info.textContent =
+      carrierImage.width + " x " + carrierImage.height + " px  |  " +
+      stegCapacityBytes(carrierImage.width, carrierImage.height).toLocaleString() +
+      " bytes of capacity (3 bits per pixel, R/G/B only)";
+    if (onReady) onReady();
+  };
+  img.onerror = () => alert("That file could not be read as an image");
+  img.src = url;
+}
+
+function showCarrier() {
+  const c = document.getElementById("carrierPreview");
+  c.width = carrierImage.width;
+  c.height = carrierImage.height;
+  const cx = c.getContext("2d");
+  cx.putImageData(carrierImage, 0, 0);
+}
+
+async function encryptIntoImage() {
+  const text = document.getElementById("inputText").value;
+  const key = document.getElementById("keyInput").value;
+  const status = document.getElementById("stegStatus");
+  const btn = document.getElementById("btnStegEncode");
+
+  if (!text) return alert("Enter some text first");
+  if (!carrierImage) return alert("Choose a carrier image first");
+
+  btn.disabled = true;
+  status.textContent = "compressing...";
+
+  let pick;
+  try {
+    pick = await benchmarkCodecs(text, key, status);
+  } catch (e) {
+    btn.disabled = false;
+    return alert("Could not load the codec list.\n\n" + e.message);
+  }
+
+  const { winner, originalBytes } = pick;
+  if (!winner || !winner.bytes) {
+    btn.disabled = false;
+    return alert("No codec succeeded.");
+  }
+
+  // The LSB stream is bytes all the way down, so a base64 transport codec
+  // would only add overhead. Prefer the raw-byte codecs when one is close.
+  const best = candidatesByCost(pick.candidates);
+  const useRaw = best.filter((c) => c.mode === "raw")
+                      .sort((a, b) => a.cost - b.cost)[0];
+  const chosen = useRaw && useRaw.cost <= best[0].cost ? useRaw : best[0];
+
+  const payload = chosen.bytes;
+  let sum = 0;
+  for (let i = 0; i < payload.length; i++) sum += payload[i];
+  const header = stegBuildHeader(chosen.id, payload.length, originalBytes.length, sum & 0xFF);
+
+  const stream = new Uint8Array(STEG_HEADER_BYTES + payload.length);
+  stream.set(header, 0);
+  stream.set(payload, STEG_HEADER_BYTES);
+
+  const capacityBytes = stegCapacityBytes(carrierImage.width, carrierImage.height);
+  if (stream.length > capacityBytes) {
+    btn.disabled = false;
+    status.textContent = "";
+    return alert(
+      "Does not fit.\n\n" +
+      "Needed     : " + stream.length.toLocaleString() + " bytes\n" +
+      "Available  : " + capacityBytes.toLocaleString() + " bytes\n" +
+      "Overage    : " + (stream.length - capacityBytes).toLocaleString() + " bytes\n\n" +
+      "Use a bigger image, or shorter text."
+    );
+  }
+
+  // copy so the original carrier is left untouched for repeated attempts
+  const out = new ImageData(
+    new Uint8ClampedArray(carrierImage.data), carrierImage.width, carrierImage.height
+  );
+  stegWrite(out.data, stream, 0);
+
+  const c = document.getElementById("carrierPreview");
+  c.width = out.width;
+  c.height = out.height;
+  c.getContext("2d").putImageData(out, 0, 0);
+
+  const pct = ((stream.length / capacityBytes) * 100).toFixed(1);
+  status.textContent =
+    chosen.name + " | " + stream.length.toLocaleString() + " of " +
+    capacityBytes.toLocaleString() + " bytes used (" + pct + "%)";
+
+  c.toBlob((blob) => {
+    const link = document.createElement("a");
+    link.download = "carrier.png";
+    link.href = URL.createObjectURL(blob);
+    link.click();
+  }, "image/png");
+
+  btn.disabled = false;
+}
+
+function candidatesByCost(cands) {
+  return cands.filter((c) => c.bytes !== null).sort((a, b) => a.cost - b.cost);
+}
+
+async function extractFromImage() {
+  const status = document.getElementById("stegStatus");
+  const btn = document.getElementById("btnStegDecode");
+  if (!carrierImage) return alert("Choose the image that has text hidden in it");
+
+  btn.disabled = true;
+  status.textContent = "reading...";
+
+  let header;
+  try {
+    header = stegParseHeader(stegRead(carrierImage.data, STEG_HEADER_BYTES, 0));
+  } catch (e) {
+    btn.disabled = false;
+    return alert("Could not read a header from this image: " + e.message);
+  }
+  if (!header) {
+    btn.disabled = false;
+    return alert("No hidden data found in this image.");
+  }
+
+  let payload, text, name;
+  try {
+    payload = stegRead(carrierImage.data, header.payloadLen, STEG_HEADER_BYTES * 8);
+    let sum = 0;
+    for (let i = 0; i < payload.length; i++) sum += payload[i];
+    const ok = (sum & 0xFF) === header.checksum;
+
+    if (header.codecId === 0) {
+      text = new TextDecoder().decode(payload);
+      name = "raw";
+    } else {
+      const codec = await getCodec(header.codecId);
+      const mode = codecMode(codec);
+      if (mode === "raw") {
+        text = codec.decodeBytes(payload);
+      } else {
+        const packed = new TextDecoder().decode(payload);
+        text = await codec.decrypt(packed, document.getElementById("keyInput").value);
+      }
+      name = codec.name || ("codec " + header.codecId);
+    }
+    if (!ok) text += "\n\n[checksum mismatch - the image may have been edited or re-saved]";
+  } catch (e) {
+    btn.disabled = false;
+    return alert("Extraction failed: " + e.message);
+  }
+
+  const out = document.getElementById("stegOutput");
+  out.style.display = "block";
+  out.textContent = text;
+  status.textContent = "extracted " + header.origLen + " characters using " + name;
+  btn.disabled = false;
 }
 
 /* ============================================================

@@ -1,14 +1,18 @@
 # PNG Encrypter
 
-Encrypts text into a tiny PNG. Runs entirely in the browser - no server, no
-upload, no network calls.
+Encrypts text into a PNG. Runs entirely in the browser - no server, no upload,
+no network calls.
 
-1. **Stage 1** - the text is compressed with whichever codec wins a benchmark run.
-2. **Stage 2** - those bytes are written into RGB pixels, 3 per pixel,
-   continuously across pixel boundaries.
+Two output modes:
 
-Decoding reads the codec id out of the image header and reverses only that codec,
-so the output is unreadable without this tool.
+- **Into a generated PNG** - the compressed bytes become the image's pixels, 3
+  per pixel. Useful for making the smallest possible file that still decodes.
+- **Into an existing image** - the compressed bytes go into the low bit of each
+  red, green and blue channel of a photo you supply. Each channel moves by at
+  most 1/255, which is not visible.
+
+Both compress with whichever codec wins a benchmark run, and both record the
+codec id in the output so decoding loads only that codec.
 
 Live at **<https://fatalmistake02.github.io/png-encrypter/>**
 
@@ -23,6 +27,41 @@ A local server is required when running from disk, because the codecs are ES
 modules and browsers block module imports on the `file://` protocol via CORS.
 Opening `index.html` directly will fail with a codec load error. `start.bat` uses
 Python if available, otherwise Node.
+
+## Modes
+
+### Generated PNG
+
+Payload bytes are written straight into R, G and B, three per pixel, continuing
+across pixel boundaries. Header lives in the first four pixels.
+
+### Hidden in an image (LSB)
+
+Capacity is **3 bits per pixel**, so a 1920x1080 image holds 777,600 bytes.
+Alpha is deliberately never touched: it is the most visible channel to change,
+and it is the one browsers premultiply.
+
+A 16-byte header holds the magic bytes, version, codec id, payload length,
+original length and a checksum. If the text does not fit, the tool says so with
+the exact overage rather than quietly truncating.
+
+The data survives lossless formats only. Re-saving as JPEG, rescaling, or
+running the image through anything that touches pixel values will destroy it.
+
+## Test harnesses
+
+```
+node codecs/_verify.js            round-trip every codec against edge cases
+node codecs/_verify_new.js        round-trip the two new codecs
+node codecs/_verify_pixels.js     full pixel pipeline, both transports
+node codecs/_verify_page.js       exercises the loader the page uses
+node codecs/_verify_cache.js      proves the per-codec cache fix
+node codecs/_verify_steg.js       LSB engine, invisibility bound, capacity
+node codecs/_verify_steg_e2e.js   image mode end to end with a real codec
+node codecs/_bench.js             density comparison across all codecs
+node _pagestest.js                serves the site under a /repo/ prefix
+node explain.js "text"            annotated byte-level walkthrough
+```
 
 ## Layout
 
@@ -43,6 +82,7 @@ codecs/            local copies of every codec - no internet needed
   pako.esm.mjs     gzip library used by kolbe 2.2/2.3 and fatal
   versions.json    the original upstream manifest, kept for reference
   _*.js            test and benchmark harnesses (see below)
+_pagestest.js    serves the site under a /repo/ prefix to mimic Pages
 ```
 
 All asset paths are relative, so the site works from a domain root or from a
@@ -76,18 +116,6 @@ best upstream codec.
 On very short inputs the gzip-based upstream codecs can still win, since gzip has
 almost no warm-up cost. The page benchmarks every codec per input and keeps
 whichever actually stores smallest, so this resolves itself.
-
-## Test harnesses
-
-```
-node codecs/_verify.js          round-trip every codec against edge cases
-node codecs/_verify_new.js      round-trip the two new codecs
-node codecs/_verify_pixels.js   full pixel pipeline, both transports
-node codecs/_verify_page.js     exercises the loader the page uses
-node codecs/_verify_cache.js    proves the per-codec cache fix
-node codecs/_bench.js           density comparison across all codecs
-node _pagestest.js              serves the site under a /repo/ prefix
-```
 
 ## Two bugs in the upstream codecs
 
